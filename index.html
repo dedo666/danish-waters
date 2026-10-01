@@ -1959,7 +1959,7 @@ html.map-mode .vignette {
                   <li><b>A crossing</b> is one pass over a strait line, in either direction: two positions no more than <span data-fill="gate-gap"></span> apart on either side of it. One ship can cross many times. Ferries that sail along a line are not counted: the Fehmarn line runs east of the Rødby–Puttgarden route.</li>
                   <li><b>A vessel-day</b> is one vessel seen on one day (UTC).</li>
                   <li><b>Speeds</b> are the speed over ground of position reports between <span data-fill="speed-window"></span>.</li>
-                  <li><b>Small boats close in.</b> From zoom <span data-fill="small-zoom"></span> on, the lines of pleasure craft and fishing boats are hidden: a single small boat's route could point to its owner.</li>
+                  <li><b>No small boats in the track lines.</b> The track lines leave out pleasure craft, fishing boats and vessels of unknown type: a single small boat's route could point to its owner. These vessels stay in the year's glow and in the figures.</li>
                   <li><b>Track lines</b> show one month at close zoom. Each line is one ship's track, simplified for the zoom level. The line tiles carry a ship type only: no ship number and no name.</li>
                   <li><b>A place</b> is a box drawn around a harbour, a bridge or a ferry line. Its figures count vessels with a moving position (at least <span data-fill="place-sog"></span>) inside the box.</li>
                 </ul>
@@ -3156,7 +3156,7 @@ function buildMap() {
   // the line layer changes only when the zoom crosses into another line level
   map.on("zoom", () => {
     const zoom = map.getZoom();
-    const band = zoom >= HANDOFF ? `${lineLevel(zoom)}-${hidesSmall(zoom)}` : null;
+    const band = zoom >= HANDOFF ? lineLevel(zoom) : null;
     if (band !== mapState.band) {
       mapState.band = band;
       refreshLines();
@@ -3325,8 +3325,10 @@ function updateScale() {
   document.getElementById("zoom-hint").hidden = !(mapMode.on && !close);
   const note = document.getElementById("map-note");
   let text = "";
-  if (hidesSmall(zoom) && ["all", ...SMALL_GROUPS].includes(state.group)) {
-    text = "This close, pleasure craft and fishing boats are hidden, to protect their owners' privacy.";
+  if (close && NO_LINE_GROUPS.includes(state.group)) {
+    text = `No track lines for ${GROUP_NAMES[state.group].toLowerCase()}: they are left out to protect the owners' privacy.`;
+  } else if (close && mapMode.on && state.group === "all") {
+    text = "The track lines leave out pleasure craft and fishing boats, to protect their owners' privacy.";
   } else if (!close && !TILES.layers.includes(state.group)) {
     text = `No map layer for ${GROUP_NAMES[state.group].toLowerCase()}. The map shows all ships, dimmed.`;
   }
@@ -3360,10 +3362,11 @@ function bindSeamarks() {
 // and a single passage stays faint. Tiles come one by one from the lines Worker; deck.gl draws them over the map.
 
 const LINES = DATA.lines; // {base, months, default, levels, maxzoom}
-// from this zoom on, pleasure craft and fishing boats are not drawn: one small boat's route could point to its owner
-const SMALL_MAX_ZOOM = 13;
-const SMALL_GROUPS = ["pleasure", "fishing"];
-const hidesSmall = (zoom) => zoom >= SMALL_MAX_ZOOM;
+// The line archives hold no pleasure craft, no fishing boats and no vessels of unknown type: one small boat's route
+// could point to its owner. These groups have no track lines at any zoom; the year's glow and the figures keep them.
+const NO_LINE_GROUPS = ["pleasure", "fishing"];
+// a new number makes every browser fetch the tiles again, after the archives change
+const LINES_VERSION = 2;
 const LINE_WIDTH = { 10: 0.5, 12: 0.8, 14: 1.1 };
 // low alpha, rising with the level: a summer month is thousands of passes, and the additive blend should reach
 // white only where lanes really stack. "All ships" draws in the gold of the year's glow, one type in its colour.
@@ -3429,7 +3432,7 @@ function lineLevel(zoom) {
 }
 
 function lineTileUrl(month, z, x, y) {
-  return `${LINES.base}/lines/${month}/${z}/${x}/${y}.bin`;
+  return `${LINES.base}/lines/${month}/${z}/${x}/${y}.bin?v=${LINES_VERSION}`;
 }
 
 let linesBusy = 0;
@@ -3465,7 +3468,7 @@ async function fetchLineTile(month, z, x, y, signal) {
 const TILE_UNITS = 65535;
 
 /** Path data for deck.gl's PathLayer from a decoded tile: the pieces of the chosen group ("all": every one). */
-function linePaths(message, group, tile, light, hideSmall) {
+function linePaths(message, group, tile, light) {
   const alpha = Math.min(255, (LINE_ALPHA[tile.z] ?? 30) * (light ? 1.3 : 1));
   const starts = message.columns.get(WIRE.SEG_START);
   const xy = message.columns.get(WIRE.XY16);
@@ -3474,9 +3477,7 @@ function linePaths(message, group, tile, light, hideSmall) {
   const keep = [];
   let vertices = 0;
   for (let s = 0; s < message.nseg; s += 1) {
-    const g = GROUP_OF_CATEGORY[category[s]];
-    if (hideSmall && SMALL_GROUPS.includes(g)) continue;
-    if (group === "all" || g === group) {
+    if (group === "all" || GROUP_OF_CATEGORY[category[s]] === group) {
       keep.push(s);
       vertices += starts[s + 1] - starts[s];
     }
@@ -3502,9 +3503,8 @@ function linePaths(message, group, tile, light, hideSmall) {
 
 /** One TileLayer for the level of the current zoom band, pinned to it: at zoom 11.5 the level-10 tiles stretch. */
 function lineLayers(zoom, month, group, light = false) {
-  if (zoom < LINES.levels[0]) return [];
+  if (zoom < LINES.levels[0] || NO_LINE_GROUPS.includes(group)) return [];
   const level = lineLevel(zoom);
-  const hideSmall = hidesSmall(zoom);
   return [
     new deck.TileLayer({
       id: `lines-${level}-${month}`,
@@ -3514,12 +3514,12 @@ function lineLayers(zoom, month, group, light = false) {
       maxRequests: 8,
       extent: TILES.bounds,
       getTileData: ({ index, signal }) => loadLineTile(month, index.z, index.x, index.y, signal),
-      updateTriggers: { renderSubLayers: [group, light, hideSmall] },
+      updateTriggers: { renderSubLayers: [group, light] },
       renderSubLayers: (props) => {
         if (!props.data || props.data.nseg === 0) return null;
         return new deck.PathLayer({
-          id: `${props.id}-${group}-${light ? "light" : "dark"}-${hideSmall ? "big" : "all"}`,
-          data: linePaths(props.data, group, props.tile.index, light, hideSmall),
+          id: `${props.id}-${group}-${light ? "light" : "dark"}`,
+          data: linePaths(props.data, group, props.tile.index, light),
           _pathType: "open",
           getWidth: LINE_WIDTH[level] ?? 1,
           widthUnits: "pixels",
@@ -4323,7 +4323,7 @@ const STEPS = {
   pleasure: { group: "pleasure", view: "archipelago" },
   straits: { group: "all", view: "gates", gates: true },
   // close-in steps: the camera goes to the centre of the place's box at a zoom where the track lines show
-  // (no closer than just under SMALL_MAX_ZOOM: the story shows every ship type)
+  // (just under zoom 13, where the lines still read as lanes and not as single hulls)
   skagen: { group: "all", place: "Skagen and Grenen", month: "2026-07", zoom: 12.9 },
   storebaelt: { group: "all", place: "Storebælt East Bridge", month: "2026-07", zoom: 12.9 },
   drogden: { group: "all", place: "Drogden and the Øresund bridge", month: "2026-07", zoom: 12.9 },
@@ -4384,7 +4384,6 @@ function fillFigures() {
   fill("pleasure-low", fmt.int(low.mean));
 
   fill("gate-gap", fmt.min(METHOD.gate_gap_min));
-  fill("small-zoom", fmt.int(SMALL_MAX_ZOOM));
   fill("place-sog", fmt.kn(METHOD.place_min_sog));
   const part = MONTHS.filter((m) => !m.whole).map((m) => `${monthName(m.ym)} (${fmt.int(m.days)} days)`);
   fill("months-caption", `${WINDOW_TEXT}. Pale bars are part-months: ${part.join(" and ")}.`);
