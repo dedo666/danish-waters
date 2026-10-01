@@ -1333,7 +1333,7 @@ html.film-on {
   position: absolute;
   left: 16px;
   right: 16px;
-  top: 11vh;
+  top: var(--film-caption, 11vh); /* under the sextant's arc: the film sets it for the screen */
   margin: 0;
   text-align: center;
   font: 400 13px/1.4 var(--mono);
@@ -3614,13 +3614,33 @@ function bindDrawer() {
   drawer.body.addEventListener("scroll", () => tipByKey || hideTip(), { passive: true });
 }
 
-// The opening film, a sextant sighting: an eye draws itself at the eyepiece, the sextant draws around it, the index
-// arm swings along the scale, a sight line runs from the horizon glass back to the eye, and the camera goes into the
-// eye's pupil and out onto the map. SVG and one animation clock; skippable, once per visit, never with
-// reduced motion. "?intro" in the address plays it again.
+// The opening film, a sextant sighting in one take. An eye opens in close-up. The camera pulls back while a sextant
+// builds itself around the eye: the telescope runs out, the limbs open like a pair of compasses and sweep the arc, the
+// scale ripples in, the index arm drops and settles. The arm swings to take the sight, the light of a star runs by the
+// index mirror and the horizon glass down the telescope into the eye, and the camera dives into the eye's pupil and
+// out onto the map. SVG and one animation clock: every part is a function of the time, so a skip can jump the clock.
+// Skippable, once per visit, never with reduced motion. "?intro" in the address plays it again.
 
-const FILM = { KEY: "showcase-film-seen", END: 7600, PUSH: 5400, PUSH_END: 7100, FADE: 6700 };
+const FILM = { KEY: "showcase-film-seen", END: 9000, PUSH: 6700, PUSH_END: 8500, FADE: 8100 };
+// when each part plays, in ms from the start
+const CUE = {
+  LIDS: [150, 1050], // the closed eye draws as one line, then the lids part
+  IRIS: [550, 1450], // the fibres of the iris grow out, the pupil narrows
+  PULL: [1500, 3300], // the camera pulls back from the eye to the whole sextant
+  SCOPE: [1500, 2350], // the telescope runs out from the eyepiece
+  GLASS: [2200, 2650],
+  LIMBS: [2400, 3150], // the limbs open like a pair of compasses and sweep the arc
+  BRACES: [2850, 3450],
+  TICKS: [2950, 3800], // the scale ripples in from its middle
+  ARM: [3100, 4200], // the index arm drops in and settles
+  BLINK: [3950, 4200],
+  SIGHT: [4300, 5500], // the arm swings to take the sight
+  STAR: [5050, 5450],
+  RAY: [5400, 6350], // the light runs from the star by the two mirrors into the eye
+  HIT: [6350, 6900], // the eye takes the light
+};
 const GOLD = "#e0a84f";
+const LIGHT = "#fff4d8";
 
 // the sextant, in its own coordinates: pivot at the top, the graduated arc below, the horizon glass on the left limb
 const SX = {
@@ -3632,10 +3652,12 @@ const SX = {
   GLASS: 22,
   EYE: [252, -66], // the observer's eye at the eyepiece: the camera goes into its pupil
   PUPIL: 21, // the pupil's radius in the eye's own coordinates
+  EYE_WIDTH: 400, // the eye from corner to corner, in its own coordinates
   EYE_SCALE: 0.3,
-  CENTRE: [60, -40], // the middle of the drawing, for the first frame
-  ARM_FROM: 119,
-  ARM_TO: 97,
+  CENTRE: [60, -40], // the middle of the drawing, for the wide shot
+  ARM_IN: 143, // the arm drops in from here,
+  ARM_FROM: 119, // rests here,
+  ARM_TO: 97, // and takes the sight here
 };
 
 function filmWanted() {
@@ -3658,206 +3680,484 @@ function markFilmSeen() {
 
 const clamp01 = (v) => Math.max(0, Math.min(1, v));
 const span = (t, a, b) => clamp01((t - a) / (b - a));
+const lerp = (a, b, t) => a + (b - a) * t;
+const bump = (x) => Math.sin(Math.PI * x); // 0, up to 1, back to 0
 const easeOut = (x) => 1 - (1 - x) ** 3;
 const easeInOut = (x) => (x < 0.5 ? 4 * x * x * x : 1 - (-2 * x + 2) ** 3 / 2);
+const easeOutBack = (x) => 1 + 2.70158 * (x - 1) ** 3 + 1.70158 * (x - 1) ** 2; // past the end, then back
 const rad = (deg) => (deg * Math.PI) / 180;
 const onArc = (r, deg) => [SX.P[0] + r * Math.cos(rad(deg)), SX.P[1] + r * Math.sin(rad(deg))];
+const fx = (v) => Number(v.toPrecision(4));
 
 function bezier(p0, p1, p2, p3, t) {
   const u = 1 - t;
   return [0, 1].map((k) => u * u * u * p0[k] + 3 * u * u * t * p1[k] + 3 * u * t * t * p2[k] + t * t * t * p3[k]);
 }
 
+/** Sets an attribute only when it changes: most parts of the drawing stand still in most frames. */
+function put(node, name, value) {
+  const v = String(value);
+  if (node.getAttribute(name) !== v) node.setAttribute(name, v);
+}
+
+// ---------------------------------------------------------------------- lines that draw on
+
 /**
- * Strokes that draw on: a dash over pathLength 1, at a width that looks the same on screen. Once drawn they switch
- * to a non-scaling stroke, so they stay one screen pixel wide however far the camera pushes.
+ * The lines of the drawing. The clock sets each line's width from the camera every frame, so a line looks the same on
+ * screen at any zoom. A dashed line is hidden until the clock draws it.
  */
-function strokeMaker(k, list) {
-  return (parent, attrs, scale = 1) => {
-    const w = attrs["stroke-width"] ?? 1.3;
-    const node = el("path", { fill: "none", stroke: GOLD, pathLength: 1, "stroke-dasharray": 1, "stroke-dashoffset": 1, "stroke-linecap": "round", "stroke-linejoin": "round", ...attrs, "stroke-width": w / (k * scale) }, parent);
-    node.dataset.width = String(w);
-    list.push(node);
+function lineMaker(list) {
+  return (parent, attrs, { w = 1.3, scale = 1, dash = true } = {}) => {
+    const hidden = dash ? { pathLength: 1, "stroke-dasharray": "1 1", "stroke-dashoffset": 1, visibility: "hidden" } : {};
+    const node = el("path", { fill: "none", stroke: GOLD, "stroke-linecap": "round", "stroke-linejoin": "round", ...hidden, ...attrs }, parent);
+    list.push({ node, w, scale });
     return node;
   };
 }
 
-/** The observer's eye, in its own coordinates (about 400 by 260, pupil at 0, -6). */
-function eyeArt(parent, stroke, scale, k) {
-  const g = el("g", {}, parent);
-  const upper = [[-200, 0], [-120, -92], [120, -92], [200, 0]];
-  const lower = [[-200, 0], [-120, 72], [120, 72], [200, 0]];
-  const d = (c) => `M${c[0]} C${c[1]} ${c[2]} ${c[3]}`;
-  for (let i = 0; i < 6; i += 1) {
-    const y = -138 + i * 8;
-    stroke(g, { d: `M${-140 + i * 10} ${y + 18} C-80 ${y - 14} 70 ${y - 18} ${140 - i * 8} ${y + 14}`, "stroke-width": 0.7, opacity: 0.55 }, scale);
-  }
-  stroke(g, { d: d(upper), "stroke-width": 1.6 }, scale);
-  stroke(g, { d: d(lower) }, scale);
-  for (let i = 1; i < 12; i += 1) {
-    const t = i / 12;
-    const [x, y] = bezier(...upper, t);
-    const lean = (t - 0.5) * 30;
-    stroke(g, { d: `M${x} ${y} q${lean * 0.4} -9 ${lean} -${14 + 7 * Math.sin(Math.PI * t)}`, "stroke-width": 0.8 }, scale);
-  }
-  const clip = el("clipPath", { id: "film-almond" }, el("defs", {}, g));
-  el("path", { d: `${d(upper)} C120 72 -120 72 -200 0 Z` }, clip);
-  const iris = el("g", { "clip-path": "url(#film-almond)", opacity: 0 }, g);
-  const grad = el("radialGradient", { id: "film-iris" }, el("defs", {}, iris));
+/** Draws a line from its start, to the share p of its length. */
+function draw(node, p) {
+  put(node, "visibility", p > 0 ? "visible" : "hidden");
+  put(node, "stroke-dashoffset", fx(1 - p));
+}
+
+/** Draws a line from its middle out to both ends. */
+function drawOut(node, p) {
+  put(node, "visibility", p > 0 ? "visible" : "hidden");
+  put(node, "stroke-dasharray", `${fx(p)} 1`);
+  put(node, "stroke-dashoffset", fx(-(1 - p) / 2));
+}
+
+// ---------------------------------------------------------------------- the drawing
+
+/** The iris and the pupil, inside the lids: "look" moves them with the gaze, "spin" turns the fibres. */
+function irisArt(parent) {
+  const almond = el("path", {}, el("clipPath", { id: "film-almond" }, el("defs", {}, parent)));
+  const iris = el("g", { "clip-path": "url(#film-almond)" }, parent);
+  const look = el("g", {}, iris);
+  const grad = el("radialGradient", { id: "film-iris" }, el("defs", {}, look));
   el("stop", { offset: "0.3", "stop-color": "#0d2342" }, grad);
   el("stop", { offset: "0.82", "stop-color": "#6b4a18" }, grad);
   el("stop", { offset: "1", "stop-color": GOLD }, grad);
-  el("circle", { cx: 0, cy: -6, r: 58, fill: "url(#film-iris)" }, iris);
-  for (let i = 0; i < 36; i += 1) {
+  const disc = el("circle", { cx: 0, cy: -6, r: 58, fill: "url(#film-iris)", opacity: 0 }, look);
+  const spin = el("g", {}, look);
+  const fibres = Array.from({ length: 36 }, (_, i) => {
     const a = (i / 36) * Math.PI * 2;
-    el("line", { x1: Math.cos(a) * 24, y1: -6 + Math.sin(a) * 24, x2: Math.cos(a) * 56, y2: -6 + Math.sin(a) * 56, stroke: GOLD, "stroke-width": 0.8, "vector-effect": "non-scaling-stroke", opacity: 0.6 }, iris);
-  }
-  el("circle", { cx: 0, cy: -6, r: 21, fill: "#04070b" }, iris);
-  el("circle", { cx: 12, cy: -20, r: 5, fill: "#fff4d8", opacity: 0.85 }, iris);
-  return { g, iris };
+    const node = el("line", { x1: fx(Math.cos(a) * 24), y1: fx(-6 + Math.sin(a) * 24), stroke: GOLD, "stroke-width": 0.8, "vector-effect": "non-scaling-stroke", opacity: 0 }, spin);
+    return { node, a };
+  });
+  const pupil = el("circle", { cx: 0, cy: -6, r: SX.PUPIL, fill: "#04070b", opacity: 0 }, look);
+  const glint = el("circle", { cx: 12, cy: -20, r: 0, fill: LIGHT, opacity: 0.85 }, look);
+  const flare = el("circle", { cx: 0, cy: -6, r: 66, fill: "url(#film-glow)", opacity: 0 }, look);
+  return { almond, look, disc, spin, fibres, pupil, glint, flare };
 }
 
-/** The sextant: frame, arc with its scale, handle, telescope, horizon glass and the index arm. */
-function sextantArt(parent, stroke) {
+/** The observer's eye, in its own coordinates (about 400 by 260, pupil at 0, -6). The lids are set by setLids. */
+function eyeArt(parent, line) {
   const g = el("g", {}, parent);
-  const { P, R, A0, A1, H, GLASS } = SX;
-  const [a0, a1] = [onArc(R, A0), onArc(R, A1)];
+  const scale = SX.EYE_SCALE;
+  const brows = Array.from({ length: 6 }, (_, i) => {
+    const y = -138 + i * 8;
+    return line(g, { d: `M${-140 + i * 10} ${y + 18} C-80 ${y - 14} 70 ${y - 18} ${140 - i * 8} ${y + 14}`, opacity: 0.55 }, { w: 0.7, scale });
+  });
+  const upper = line(g, {}, { w: 1.6, scale });
+  const lower = line(g, {}, { scale });
+  const lashes = Array.from({ length: 11 }, () => line(g, { opacity: 0 }, { w: 0.8, scale, dash: false }));
+  // the light arrives: rings that leave the eye
+  const ripples = [0, 1].map(() => el("circle", { cx: 0, cy: -6, r: 0, fill: "none", stroke: GOLD, "stroke-width": 1, "vector-effect": "non-scaling-stroke", opacity: 0 }, g));
+  return { brows, upper, lower, lashes, ripples, ...irisArt(g) };
+}
+
+/** The lids, from shut (0) to open (1): shut, both lie on one line; the lashes turn down with the upper lid. */
+function setLids(eye, open) {
+  const uy = fx(lerp(24, -92, open));
+  const ly = fx(lerp(24, 72, open));
+  const upper = [[-200, 0], [-120, uy], [120, uy], [200, 0]];
+  put(eye.upper, "d", `M-200 0 C-120 ${uy} 120 ${uy} 200 0`);
+  put(eye.lower, "d", `M-200 0 C-120 ${ly} 120 ${ly} 200 0`);
+  put(eye.almond, "d", `M-200 0 C-120 ${uy} 120 ${uy} 200 0 C120 ${ly} -120 ${ly} -200 0 Z`);
+  eye.lashes.forEach((lash, i) => {
+    const t = (i + 1) / 12;
+    const [x, y] = bezier(...upper, t);
+    const lean = (t - 0.5) * 30;
+    const rise = lerp(9, -(14 + 7 * Math.sin(Math.PI * t)), open);
+    put(lash, "d", `M${fx(x)} ${fx(y)} q${fx(lean * 0.4)} ${fx(rise * 0.62)} ${fx(lean)} ${fx(rise)}`);
+  });
+}
+
+/** The telescope, from the eyepiece out to the horizon glass, on its bracket. */
+function scopeArt(g, line) {
+  const y = SX.H[1];
+  const end = SX.H[0] + 34;
+  return [
+    line(g, { d: `M224 ${y - 15} L200 ${y - 15} L200 ${y + 15} L224 ${y + 15} Z` }, { w: 1.2 }),
+    line(g, { d: `M200 ${y - 11} L${end} ${y - 11}` }, { w: 1.2 }),
+    line(g, { d: `M200 ${y + 11} L${end} ${y + 11}` }, { w: 1.2 }),
+    line(g, { d: `M${end} ${y - 14} L${end} ${y + 14}` }, { w: 1.2 }),
+    line(g, { d: `M110 ${y + 11} L118 ${y + 40}` }, { w: 1 }),
+  ];
+}
+
+/** The horizon glass: a ring, half of it silvered, and a glint that runs round it. */
+function glassArt(g, line) {
+  const [x, y] = SX.H;
+  const r = SX.GLASS;
+  const holder = el("g", {}, g);
+  line(holder, { d: `M${x + r} ${y} A${r} ${r} 0 1 1 ${x + r - 0.01} ${y - 0.4}` }, { w: 1.4, dash: false });
+  line(holder, { d: `M${x} ${y - r} L${x} ${y + r}`, opacity: 0.55 }, { w: 0.8, dash: false });
+  const glint = line(holder, { d: `M${x + r - 5} ${y} A${r - 5} ${r - 5} 0 0 0 ${fx(x + (r - 5) * Math.cos(rad(-70)))} ${fx(y + (r - 5) * Math.sin(rad(-70)))}`, stroke: LIGHT, opacity: 0 }, { w: 1.6, dash: false });
+  return { holder, glint };
+}
+
+/** The frame: two limbs that hang straight down from the pivot until the clock opens them, the arcs and the braces. */
+function frameArt(g, line) {
+  const { P, R, A0, A1 } = SX;
   const arc = (r, from, to) => {
     const [p, q] = [onArc(r, from), onArc(r, to)];
     return `M${p[0]} ${p[1]} A${r} ${r} 0 0 1 ${q[0]} ${q[1]}`;
   };
-  // frame: the two limbs, the double arc, the braces
-  stroke(g, { d: `M${P[0]} ${P[1]} L${a0[0]} ${a0[1]}`, "stroke-width": 1.6 });
-  stroke(g, { d: `M${P[0]} ${P[1]} L${a1[0]} ${a1[1]}`, "stroke-width": 1.6 });
-  stroke(g, { d: arc(R, A0, A1), "stroke-width": 1.6 });
-  stroke(g, { d: arc(R - 26, A0, A1) });
-  stroke(g, { d: arc(R - 150, A0 + 4, A1 - 4), "stroke-width": 1 });
+  const limbs = [1, -1].map((side) => {
+    const holder = el("g", {}, g);
+    return { holder, side, line: line(holder, { d: `M${P[0]} ${P[1]} L${P[0]} ${P[1] + R}` }, { w: 1.6 }) };
+  });
+  const arcs = [line(g, { d: arc(R, A0, A1) }, { w: 1.6 }), line(g, { d: arc(R - 26, A0, A1) })];
+  const braces = [line(g, { d: arc(R - 150, A0 + 4, A1 - 4) }, { w: 1 })];
   for (const t of [0.45, 0.72]) {
     const [l, r] = [onArc(R * t, A1 - 1), onArc(R * t, A0 + 1)];
-    stroke(g, { d: `M${l[0]} ${l[1]} L${r[0]} ${r[1]}`, "stroke-width": 0.9, opacity: 0.8 });
+    braces.push(line(g, { d: `M${l[0]} ${l[1]} L${r[0]} ${r[1]}`, opacity: 0.8 }, { w: 0.9 }));
   }
   // the scale: a tick every 2°, long ones every 10°
+  const ticks = [];
   for (let a = A0 + 2; a < A1; a += 2) {
     const long = a % 10 === 0;
     const [p, q] = [onArc(R - 26, a), onArc(R - (long ? 4 : 14), a)];
-    stroke(g, { d: `M${p[0]} ${p[1]} L${q[0]} ${q[1]}`, "stroke-width": long ? 1 : 0.7 });
+    ticks.push({ a, node: line(g, { d: `M${p[0]} ${p[1]} L${q[0]} ${q[1]}` }, { w: long ? 1 : 0.7 }) });
   }
+  return { limbs, arcs, braces, ticks };
+}
+
+/** The sextant: frame, scale, handle, telescope, horizon glass, and the index arm that the clock turns. */
+function sextantArt(parent, line) {
+  const g = el("g", {}, parent);
+  const { P, R } = SX;
+  const frame = frameArt(g, line);
   // the handle behind the right limb
-  stroke(g, { d: "M120 -40 C190 -30 200 40 150 70", "stroke-width": 1.2, opacity: 0.8 });
-  stroke(g, { d: "M104 -12 C160 -2 168 40 134 58", "stroke-width": 0.9, opacity: 0.6 });
-  // the telescope: a tube from the horizon glass to the eyepiece, on a bracket
-  stroke(g, { d: `M${H[0] + 34} ${H[1] - 11} L200 ${H[1] - 11} M${H[0] + 34} ${H[1] + 11} L200 ${H[1] + 11}`, "stroke-width": 1.2 });
-  stroke(g, { d: `M200 ${H[1] - 15} L224 ${H[1] - 15} L224 ${H[1] + 15} L200 ${H[1] + 15} Z`, "stroke-width": 1.2 });
-  stroke(g, { d: `M110 ${H[1] + 11} L118 ${H[1] + 40}`, "stroke-width": 1 });
-  // the horizon glass: the camera's way in
-  stroke(g, { d: `M${H[0] + GLASS} ${H[1]} A${GLASS} ${GLASS} 0 1 1 ${H[0] + GLASS - 0.01} ${H[1] - 0.4}`, "stroke-width": 1.4 });
-  // the index arm, drawn at rest and turned by the clock
+  const handle = [line(g, { d: "M120 -40 C190 -30 200 40 150 70", opacity: 0.8 }, { w: 1.2 }), line(g, { d: "M104 -12 C160 -2 168 40 134 58", opacity: 0.6 }, { w: 0.9 })];
+  const scope = scopeArt(g, line);
+  const glass = glassArt(g, line);
+  // the index arm, drawn straight down and turned by the clock: the arm, its window on the scale, the index mirror
   const arm = el("g", {}, g);
   const tip = onArc(R + 8, 90);
-  stroke(arm, { d: `M${P[0]} ${P[1]} L${tip[0]} ${tip[1]}`, "stroke-width": 1.8 });
-  stroke(arm, { d: `M${tip[0] - 16} ${tip[1] - 34} h32 v28 h-32 Z`, "stroke-width": 1 });
-  stroke(arm, { d: `M${P[0] - 16} ${P[1] - 8} h32 v16 h-32 Z`, "stroke-width": 1.2 });
-  el("circle", { cx: P[0], cy: P[1], r: 4, fill: GOLD }, g);
-  return { g, arm };
+  const armLines = [
+    line(arm, { d: `M${P[0]} ${P[1]} L${tip[0]} ${tip[1]}` }, { w: 1.8 }),
+    line(arm, { d: `M${P[0] - 16} ${P[1] - 8} h32 v16 h-32 Z` }, { w: 1.2 }),
+    line(arm, { d: `M${tip[0] - 16} ${tip[1] - 34} h32 v28 h-32 Z` }, { w: 1 }),
+  ];
+  const pivot = el("circle", { cx: P[0], cy: P[1], r: 0, fill: GOLD }, g);
+  const pulse = el("circle", { cx: P[0], cy: P[1], r: 0, fill: "none", stroke: GOLD, "stroke-width": 1, "vector-effect": "non-scaling-stroke", opacity: 0 }, g);
+  return { ...frame, handle, scope, glass, arm, armLines, pivot, pulse };
 }
+
+/**
+ * The light of the sight: from a star to the index mirror, to the horizon glass, down the telescope into the eye. The
+ * star stands where the mirror on the arm, at the angle of the sight, sends its light to the horizon glass.
+ */
+function rayArt(parent, line, lay) {
+  const { P, H, EYE } = SX;
+  const out = [H[0] - P[0], H[1] - P[1]].map((v) => v / Math.hypot(H[0] - P[0], H[1] - P[1]));
+  const normal = [Math.sin(rad(SX.ARM_TO)), -Math.cos(rad(SX.ARM_TO))];
+  const dot = out[0] * normal[0] + out[1] * normal[1];
+  const inward = [out[0] - 2 * dot * normal[0], out[1] - 2 * dot * normal[1]]; // the way the light comes down to the mirror
+  const top = EYE[1] - lay.pupil[1] / lay.k; // the top of the screen in the wide shot
+  const far = Math.max(40, Math.min(250, (P[1] - top) / inward[1] - 14 / lay.k));
+  const star = [P[0] - inward[0] * far, P[1] - inward[1] * far];
+  const points = [star, P, H, EYE];
+  const lengths = [1, 2, 3].map((i) => Math.hypot(points[i][0] - points[i - 1][0], points[i][1] - points[i - 1][1]));
+  const total = lengths.reduce((a, b) => a + b, 0);
+  const stops = [0, lengths[0] / total, (lengths[0] + lengths[1]) / total, 1]; // the share of the way at each point
+  const d = `M${points.map((p) => `${fx(p[0])} ${fx(p[1])}`).join(" L")}`;
+  const g = el("g", {}, parent);
+  const glow = (r) => el("circle", { r: fx(r / lay.k), fill: "url(#film-glow)", opacity: 0 }, g);
+  const burst = (at) => el("path", { d: "M-1 0H1M0 -1V1M-.6 -.6L.6 .6M-.6 .6L.6 -.6", fill: "none", stroke: LIGHT, "stroke-width": 1.2, "stroke-linecap": "round", "vector-effect": "non-scaling-stroke", opacity: 0, "data-at": at.join(" ") }, g);
+  const halo = glow(16);
+  put(halo, "cx", fx(star[0]));
+  put(halo, "cy", fx(star[1]));
+  return {
+    points,
+    stops,
+    halo,
+    star: el("circle", { cx: fx(star[0]), cy: fx(star[1]), r: fx(1.8 / lay.k), fill: LIGHT, opacity: 0 }, g),
+    path: line(g, { d, stroke: LIGHT }, { w: 1 }),
+    trail: line(g, { d, stroke: LIGHT }, { w: 2.4 }),
+    head: glow(11),
+    bursts: [burst(P), burst(H)],
+  };
+}
+
+/** The point of the light's way at the share u of its length. */
+function rayPoint(ray, u) {
+  const i = u >= ray.stops[2] ? 2 : u >= ray.stops[1] ? 1 : 0;
+  const f = span(u, ray.stops[i], ray.stops[i + 1]);
+  return [0, 1].map((k) => lerp(ray.points[i][k], ray.points[i + 1][k], f));
+}
+
+/** A sky of faint stars behind the drawing, in screen units: the same sky on every visit. */
+function skyArt(parent, W, H) {
+  const g = el("g", { opacity: 0 }, parent);
+  let seed = 20250925;
+  const random = () => {
+    seed = (seed * 1664525 + 1013904223) % 4294967296;
+    return seed / 4294967296;
+  };
+  const stars = Array.from({ length: 70 }, () => {
+    const dim = 0.12 + 0.4 * random() ** 2;
+    return { dim, phase: random() * 6.28, node: el("circle", { cx: fx(random() * W), cy: fx(random() * H), r: fx(0.5 + random() * 0.8), fill: "#c9d6e2", opacity: dim }, g) };
+  });
+  return { g, stars };
+}
+
+// ---------------------------------------------------------------------- the screen
+
+/** Where things sit on this screen: the whole sextant with the eye at its eyepiece, and the eye alone in close-up. */
+function filmLayout() {
+  const W = window.innerWidth;
+  const H = window.innerHeight;
+  const narrow = W < 700;
+  const k = Math.min(W / 640, H / 470);
+  const stage = document.getElementById("stage").getBoundingClientRect();
+  const middle = narrow ? stage.top + stage.height / 2 : H * 0.46;
+  // where the pupil sits in the wide shot; the camera zooms about it
+  const pupil = [W / 2 + k * (SX.EYE[0] - SX.CENTRE[0]), middle + k * (SX.EYE[1] - SX.CENTRE[1])];
+  return {
+    W,
+    H,
+    narrow,
+    k,
+    pupil,
+    close: [W / 2, narrow ? middle : H * 0.47], // where the pupil sits in the close shot
+    zoom: Math.min(W * 0.78, 600) / (SX.EYE_WIDTH * SX.EYE_SCALE * k), // how much closer the close shot is
+    caption: Math.min(H - 56, pupil[1] + k * (SX.P[1] + SX.R + 8 - SX.EYE[1]) + 30), // under the arc
+  };
+}
+
+/** The drawing: a dark sheet with a hole that opens at the pupil, and on it the sky, the eye, the sextant, the light. */
+function filmScene(lay) {
+  const { W, H } = lay;
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none" });
+  const defs = el("defs", {}, svg);
+  const glow = el("radialGradient", { id: "film-glow" }, defs);
+  el("stop", { offset: "0", "stop-color": LIGHT }, glow);
+  el("stop", { offset: "0.35", "stop-color": "#ffd98a", "stop-opacity": 0.55 }, glow);
+  el("stop", { offset: "1", "stop-color": GOLD, "stop-opacity": 0 }, glow);
+  const mask = el("mask", { id: "film-hole", maskUnits: "userSpaceOnUse", x: 0, y: 0, width: W, height: H }, defs);
+  el("rect", { x: 0, y: 0, width: W, height: H, fill: "#fff" }, mask);
+  const hole = el("circle", { r: 0, fill: "#000" }, mask);
+  const cut = el("g", { mask: "url(#film-hole)" }, svg);
+  el("rect", { x: 0, y: 0, width: W, height: H, fill: "#04070b" }, cut);
+  const sky = skyArt(cut, W, H);
+  const scene = el("g", {}, cut);
+  const lines = [];
+  const line = lineMaker(lines);
+  const sextant = sextantArt(scene, line);
+  const ray = rayArt(scene, line, lay);
+  const eyeHolder = el("g", { transform: `translate(${SX.EYE[0]} ${SX.EYE[1]}) scale(${SX.EYE_SCALE}) translate(0 6)` }, scene);
+  const eye = eyeArt(eyeHolder, line);
+  return { svg, hole, sky, scene, lines, sextant, ray, eye };
+}
+
+/** The label by the eye, in screen units so it stays legible: the leader runs from the upper lid up to the text. */
+function filmLabel(svg, { W, k, pupil, narrow }) {
+  const label = el("g", { opacity: 0 }, svg);
+  const lidTop = pupil[1] - 72 * SX.EYE_SCALE * k;
+  const ly = lidTop - 64;
+  const right = pupil[0] + 40 + 250 < W - 16; // to the right if it fits, else to the left
+  const corner = pupil[0] + (right ? 40 : -40);
+  const lx = right ? corner + 8 : corner - 250;
+  el("path", { d: `M${pupil[0]} ${lidTop} L${corner} ${ly} H${right ? corner + 250 : corner - 250}`, fill: "none", stroke: GOLD, "stroke-width": 1 }, label);
+  el("text", { x: lx, y: ly - 26, class: "film-label" }, label).textContent = `AIS · ${fmt.big(M.ingest.rows_in)} signals`;
+  el("text", { x: lx, y: ly - 8, class: "film-label film-label-2" }, label).textContent = "one year of Danish waters";
+  if (narrow) label.setAttribute("visibility", "hidden");
+  return label;
+}
+
+// ---------------------------------------------------------------------- the motion
+
+/** The index arm's angle: it drops in and swings to rest; then it draws back a little and swings to the sight. */
+function armAngle(t) {
+  const drop = (t - CUE.ARM[0] - 100) / 1000;
+  if (t < CUE.SIGHT[0]) return SX.ARM_FROM + (SX.ARM_IN - SX.ARM_FROM) * (drop <= 0 ? 1 : Math.exp(-5 * drop) * Math.cos(10 * drop));
+  const back = span(t, CUE.SIGHT[0], CUE.SIGHT[0] + 200);
+  if (back < 1) return SX.ARM_FROM + 3 * Math.sin((Math.PI / 2) * back);
+  const s = (t - CUE.SIGHT[0] - 200) / 1000;
+  return SX.ARM_TO + (SX.ARM_FROM + 3 - SX.ARM_TO) * Math.exp(-4.5 * s) * (Math.cos(9 * s) + 0.5 * Math.sin(9 * s));
+}
+
+/** The camera: close on the eye, back to the whole sextant, a breath back, then into the pupil with a slow roll. */
+function filmCamera(lay, t) {
+  const pull = easeInOut(span(t, ...CUE.PULL));
+  const push = span(t, FILM.PUSH, FILM.PUSH_END);
+  const breath = 1 - 0.06 * bump(span(t, FILM.PUSH - 450, FILM.PUSH + 150));
+  const still = 1 - span(push, 0, 0.3); // the slow drift of the camera stops for the dive
+  return {
+    push,
+    at: [lerp(lay.close[0], lay.pupil[0], pull) + 3 * Math.sin(t / 1900) * still, lerp(lay.close[1], lay.pupil[1], pull) + 2 * Math.cos(t / 2600) * still],
+    scale: lay.k * lay.zoom ** (1 - pull) * breath * (1 + 320 * push ** 3),
+    roll: -14 * push ** 2,
+  };
+}
+
+/** The pupil's radius: wide in the dark, narrower as the eye wakes, a start at the light, then wide for the dive. */
+function pupilRadius(t) {
+  const wake = lerp(31, SX.PUPIL, easeInOut(span(t, CUE.IRIS[0] + 350, CUE.IRIS[1] + 250)));
+  return wake - 7 * span(t, CUE.HIT[0], CUE.HIT[0] + 160) + 10 * easeInOut(span(t, CUE.HIT[0] + 250, FILM.PUSH));
+}
+
+function frameEye(eye, t, cam) {
+  const open = easeOutBack(span(t, CUE.LIDS[0] + 200, CUE.LIDS[1])) * (1 - 0.96 * bump(span(t, ...CUE.BLINK))) + 0.06 * span(t, CUE.HIT[0], CUE.HIT[0] + 200);
+  setLids(eye, open);
+  for (const lid of [eye.upper, eye.lower]) drawOut(lid, easeOut(span(t, CUE.LIDS[0], CUE.LIDS[0] + 300)));
+  for (const lash of eye.lashes) put(lash, "opacity", fx(span(t, CUE.LIDS[0] + 150, CUE.LIDS[0] + 500)));
+  eye.brows.forEach((brow, i) => draw(brow, easeOut(span(t, 500 + i * 70, 1200 + i * 70))));
+  put(eye.disc, "opacity", fx(span(t, CUE.IRIS[0], CUE.IRIS[0] + 400)));
+  put(eye.pupil, "opacity", fx(span(t, CUE.IRIS[0], CUE.IRIS[0] + 300)));
+  put(eye.pupil, "r", fx(pupilRadius(t)));
+  eye.fibres.forEach(({ node, a }, i) => {
+    const grow = easeOut(span(t, CUE.IRIS[0] + 50 + i * 14, CUE.IRIS[0] + 450 + i * 14));
+    put(node, "x2", fx(Math.cos(a) * lerp(24, 56, grow)));
+    put(node, "y2", fx(-6 + Math.sin(a) * lerp(24, 56, grow)));
+    put(node, "opacity", fx(0.6 * Math.min(1, grow * 3)));
+  });
+  put(eye.spin, "transform", `rotate(${fx(6 * Math.sin(t / 1400) + 120 * cam.push ** 2)} 0 -6)`);
+  put(eye.glint, "r", fx(Math.max(0, 5 * easeOutBack(span(t, 1100, 1450)))));
+  // the eye looks down the telescope while the sextant builds, and straight out for the light
+  const gaze = easeInOut(span(t, 1650, 1950)) * (1 - easeInOut(span(t, CUE.HIT[0] - 100, CUE.HIT[0] + 250)));
+  put(eye.look, "transform", `translate(${fx(-18 * gaze)} ${fx(2 * gaze)})`);
+  put(eye.flare, "opacity", fx(0.9 * bump(span(t, CUE.HIT[0] - 60, CUE.HIT[0] + 600))));
+  eye.ripples.forEach((ring, i) => {
+    const p = span(t, CUE.HIT[0] + i * 180, CUE.HIT[0] + 700 + i * 180);
+    put(ring, "r", fx(lerp(60, 280, easeOut(p))));
+    put(ring, "opacity", fx(p > 0 ? 0.6 * (1 - p) : 0));
+  });
+}
+
+function frameSextant(sx, t) {
+  const { P, H } = SX;
+  // the telescope runs out from the eyepiece; the glass and the pivot spring up
+  draw(sx.scope[0], easeOut(span(t, CUE.SCOPE[0], CUE.SCOPE[0] + 350)));
+  draw(sx.scope[1], easeOut(span(t, CUE.SCOPE[0] + 150, CUE.SCOPE[1] - 50)));
+  draw(sx.scope[2], easeOut(span(t, CUE.SCOPE[0] + 230, CUE.SCOPE[1])));
+  draw(sx.scope[3], span(t, CUE.SCOPE[1] - 50, CUE.SCOPE[1] + 100));
+  draw(sx.scope[4], easeOut(span(t, CUE.SCOPE[1], CUE.SCOPE[1] + 300)));
+  put(sx.glass.holder, "transform", `translate(${H[0]} ${H[1]}) scale(${fx(Math.max(0, easeOutBack(span(t, ...CUE.GLASS))))}) translate(${-H[0]} ${-H[1]})`);
+  const glint = span(t, CUE.GLASS[1] - 100, CUE.GLASS[1] + 600);
+  put(sx.glass.glint, "opacity", fx(bump(glint)));
+  put(sx.glass.glint, "transform", `rotate(${fx(-220 * easeInOut(glint))} ${H[0]} ${H[1]})`);
+  put(sx.pivot, "r", fx(Math.max(0, 4 * easeOutBack(span(t, CUE.LIMBS[0] - 150, CUE.LIMBS[0] + 200)))));
+  const pulse = span(t, CUE.LIMBS[0] - 100, CUE.LIMBS[0] + 500);
+  put(sx.pulse, "r", fx(4 + 26 * easeOut(pulse)));
+  put(sx.pulse, "opacity", fx(pulse > 0 ? 0.7 * (1 - pulse) : 0));
+  // the limbs open like a pair of compasses, a little too far, and come back; the arcs follow them
+  const open = 30 * easeOutBack(span(t, ...CUE.LIMBS));
+  for (const limb of sx.limbs) {
+    put(limb.holder, "transform", `rotate(${fx(limb.side * open)} ${P[0]} ${P[1]})`);
+    draw(limb.line, easeOut(span(t, CUE.LIMBS[0] - 150, CUE.LIMBS[0] + 350)));
+  }
+  sx.arcs.forEach((arc, i) => drawOut(arc, clamp01((open - i * 2) / (30 - i * 2))));
+  sx.braces.forEach((brace, i) => drawOut(brace, easeOut(span(t, CUE.BRACES[0] + i * 100, CUE.BRACES[1] - 200 + i * 100))));
+  sx.handle.forEach((part, i) => draw(part, easeInOut(span(t, 3000 + i * 150, 3550 + i * 150))));
+  // the arm, and the scale: it ripples in from its middle, and lights up where the arm passes
+  const angle = armAngle(t);
+  put(sx.arm, "transform", `rotate(${fx(angle - 90)} ${P[0]} ${P[1]})`);
+  sx.armLines.forEach((part, i) => draw(part, easeOut(span(t, CUE.ARM[0] + i * 120, CUE.ARM[0] + 320 + i * 120))));
+  const armDrawn = span(t, CUE.ARM[0], CUE.ARM[0] + 300);
+  for (const tick of sx.ticks) {
+    const from = CUE.TICKS[0] + (Math.abs(tick.a - 90) / 28) * 550;
+    draw(tick.node, easeOut(span(t, from, from + 260)));
+    const lit = armDrawn * Math.exp(-(((tick.a - angle) / 2.4) ** 2));
+    put(tick.node, "stroke", lit > 0.03 ? `rgb(${[224, 168, 79].map((c, i) => Math.round(lerp(c, [255, 244, 216][i], lit))).join(",")})` : GOLD);
+  }
+}
+
+function frameRay(ray, t, k) {
+  const flare = bump(span(t, ...CUE.STAR));
+  put(ray.star, "opacity", fx(span(t, CUE.PULL[1] - 500, CUE.PULL[1] + 200) * (0.7 + 0.3 * Math.sin(t / 230)) * (1 - span(t, FILM.PUSH, FILM.PUSH + 300))));
+  put(ray.halo, "opacity", fx(flare));
+  const u = 0.5 - 0.5 * Math.cos(Math.PI * span(t, ...CUE.RAY));
+  const gone = 1 - span(t, FILM.PUSH, FILM.PUSH + 250);
+  // the way the light has gone stays as a faint line; a short bright stroke runs at its head
+  put(ray.path, "visibility", u > 0 ? "visible" : "hidden");
+  put(ray.path, "stroke-dasharray", `${fx(u)} 1`);
+  put(ray.path, "stroke-dashoffset", 0);
+  put(ray.path, "opacity", fx(0.34 * gone));
+  const length = Math.min(u, 0.16) * (1 - span(u, 0.92, 1));
+  put(ray.trail, "visibility", length > 0 ? "visible" : "hidden");
+  put(ray.trail, "stroke-dasharray", `${fx(length)} 1`);
+  put(ray.trail, "stroke-dashoffset", fx(-(u - length)));
+  const [x, y] = rayPoint(ray, u);
+  put(ray.head, "cx", fx(x));
+  put(ray.head, "cy", fx(y));
+  put(ray.head, "opacity", u > 0 && u < 1 ? 1 : 0);
+  // a flash at each mirror as the light turns there
+  ray.bursts.forEach((burst, i) => {
+    const turn = CUE.RAY[0] + ((CUE.RAY[1] - CUE.RAY[0]) * Math.acos(1 - 2 * ray.stops[i + 1])) / Math.PI;
+    const p = span(t, turn, turn + 380);
+    put(burst, "transform", `translate(${burst.dataset.at}) rotate(${fx(40 * p)}) scale(${fx(lerp(4, 17, easeOut(p)) / k)})`);
+    put(burst, "opacity", fx(p > 0 ? 1 - p : 0));
+  });
+}
+
+function frameSky(sky, t, cam, lay) {
+  const grow = 1 + 1.6 * cam.push ** 2;
+  put(sky.g, "opacity", fx(span(t, 0, 1400) * (1 - span(cam.push, 0.1, 0.6))));
+  // the sky is far away: it moves a little with the camera, and opens out in the dive
+  put(sky.g, "transform", `translate(${fx(cam.at[0] - 0.06 * (cam.at[0] - lay.W / 2))} ${fx(cam.at[1] - 0.06 * (cam.at[1] - lay.H / 2))}) scale(${fx(grow)}) translate(${fx(-cam.at[0])} ${fx(-cam.at[1])})`);
+  for (const star of sky.stars) put(star.node, "opacity", fx(star.dim * (0.65 + 0.35 * Math.sin(t / 420 + star.phase))));
+}
+
+// ---------------------------------------------------------------------- the clock
 
 /**
  * Runs the film over the page. onPush fires when the camera starts into the pupil (the map should light up then);
  * onDone fires when the film has gone. Returns a function that skips it.
  */
 function runFilm({ onPush, onDone }) {
-  const W = window.innerWidth;
-  const H = window.innerHeight;
-  const narrow = W < 700;
-  const k = Math.min(W / 640, H / 470);
-  const stage = document.getElementById("stage").getBoundingClientRect();
-  const centre = [W / 2, narrow ? stage.top + stage.height / 2 : H * 0.46];
-  // where the horizon glass and the pupil sit on screen before the push; the camera zooms about the pupil
-  const glass = [centre[0] + k * (SX.H[0] - SX.CENTRE[0]), centre[1] + k * (SX.H[1] - SX.CENTRE[1])];
-  const pupil = [centre[0] + k * (SX.EYE[0] - SX.CENTRE[0]), centre[1] + k * (SX.EYE[1] - SX.CENTRE[1])];
-
-  const root = h("div", { class: "film", role: "img", "aria-label": "Opening: an eye sights through a sextant, and the view goes through the eye onto the map of Danish waters" });
-  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none" }, root);
-  const mask = el("mask", { id: "film-hole", maskUnits: "userSpaceOnUse", x: 0, y: 0, width: W, height: H }, el("defs", {}, svg));
-  el("rect", { x: 0, y: 0, width: W, height: H, fill: "#fff" }, mask);
-  const hole = el("circle", { cx: pupil[0], cy: pupil[1], r: 0, fill: "#000" }, mask);
-  const cut = el("g", { mask: "url(#film-hole)" }, svg);
-  el("rect", { x: 0, y: 0, width: W, height: H, fill: "#04070b" }, cut);
-  const scene = el("g", {}, cut);
-
-  const strokes = [];
-  const eyeStrokes = [];
-  const stroke = strokeMaker(k, strokes);
-  const eyeStroke = strokeMaker(k, eyeStrokes);
-  const eyeHolder = el("g", { transform: `translate(${SX.EYE[0]} ${SX.EYE[1]}) scale(${SX.EYE_SCALE}) translate(0 6)` }, scene);
-  const eye = eyeArt(eyeHolder, eyeStroke, SX.EYE_SCALE, k);
-  const sextant = sextantArt(scene, stroke);
-  // the sight line from the horizon glass through the telescope back into the eye
-  const sight = el("path", { d: `M${SX.H[0] + SX.GLASS} ${SX.H[1]} L${SX.EYE[0] - 8} ${SX.EYE[1]}`, fill: "none", stroke: "#fff4d8", "stroke-width": 1.2 / k, pathLength: 1, "stroke-dasharray": 1, "stroke-dashoffset": 1, opacity: 0.9 }, scene);
-
-  // the label beside the arc, in screen units so it stays legible
-  const label = el("g", { opacity: 0 }, svg);
-  // above the eye: the leader runs from the upper lid up to the label, to the right if it fits, else to the left
-  const lidTop = pupil[1] - 72 * SX.EYE_SCALE * k; // the top of the upper lid
-  const ly = lidTop - 64;
-  const right = pupil[0] + 40 + 250 < W - 16;
-  const corner = pupil[0] + (right ? 40 : -40);
-  const lx = right ? corner + 8 : corner - 250;
-  el("path", { d: `M${pupil[0]} ${lidTop} L${corner} ${ly} H${right ? corner + 250 : corner - 250}`, fill: "none", stroke: GOLD, "stroke-width": 1 }, label);
-  const l1 = el("text", { x: lx, y: ly - 26, class: "film-label" }, label);
-  l1.textContent = `AIS · ${fmt.big(M.ingest.rows_in)} signals`;
-  const l2 = el("text", { x: lx, y: ly - 8, class: "film-label film-label-2" }, label);
-  l2.textContent = "one year of Danish waters";
-  if (narrow) label.setAttribute("visibility", "hidden");
-
+  const lay = filmLayout();
+  const art = filmScene(lay);
+  const label = filmLabel(art.svg, lay);
   const caption = h("p", { class: "film-caption" });
   const skip = h("button", { class: "film-skip", type: "button", text: "Skip intro · Esc" });
-  root.append(caption, skip);
+  const root = h("div", { class: "film", role: "img", "aria-label": "Opening: an eye opens at the eyepiece of a sextant, the light of a star runs through the sextant into the eye, and the view goes through the eye onto the map of Danish waters" }, [art.svg, caption, skip]);
+  root.style.setProperty("--film-caption", `${Math.round(lay.caption)}px`);
   document.body.append(root);
   document.documentElement.classList.add("film-on");
 
-  const date = WINDOW_TEXT;
-  let settled = false;
   let pushed = false;
   let done = false;
   let start = performance.now();
   let raf = 0;
-  const drawOn = (list, t0, gap, dur, t) =>
-    list.forEach((s, i) => s.setAttribute("stroke-dashoffset", String(1 - easeOut(span(t, t0 + i * gap, t0 + i * gap + dur)))));
+
+  /** The words under the drawing: the dates type themselves, then give way to the line of the sighting. */
+  const frameWords = (t) => {
+    const dates = t < CUE.PULL[1];
+    caption.textContent = dates ? WINDOW_TEXT.slice(0, Math.floor(span(t, 200, 1500) * WINDOW_TEXT.length)) : "the traffic of one year, in one sighting";
+    caption.style.opacity = String(dates ? 1 - span(t, CUE.PULL[1] - 300, CUE.PULL[1]) : span(t, CUE.PULL[1], CUE.PULL[1] + 400) * (1 - span(t, FILM.PUSH, FILM.PUSH + 500)));
+    put(label, "opacity", fx(span(t, CUE.SIGHT[0] + 700, CUE.SIGHT[0] + 1100) * (1 - span(t, FILM.PUSH, FILM.PUSH + 300))));
+  };
 
   const frame = (now) => {
     const t = now - start;
-    const typed = Math.floor(span(t, 200, 1500) * date.length);
-    caption.textContent = t < 3600 ? date.slice(0, typed) : "the traffic of one year, in one sighting";
-    caption.style.opacity = String(1 - span(t, FILM.PUSH, FILM.PUSH + 500));
-    if (!settled) {
-      // the eye first, at the entry; then the instrument around it
-      drawOn(eyeStrokes, 250, 40, 800, t);
-      drawOn(strokes, 1500, 26, 700, t);
-      if (t > 1500 + strokes.length * 26 + 750) {
-        settled = true;
-        for (const s of [...strokes, ...eyeStrokes]) {
-          s.removeAttribute("stroke-dasharray");
-          s.removeAttribute("stroke-dashoffset");
-          s.setAttribute("stroke-width", s.dataset.width);
-          s.setAttribute("vector-effect", "non-scaling-stroke");
-        }
-      }
-    }
-    eye.iris.setAttribute("opacity", String(span(t, 1000, 1500)));
-    // the index arm swings along the scale to take the sight
-    const swing = easeInOut(span(t, 3300, 4500));
-    const angle = SX.ARM_FROM + (SX.ARM_TO - SX.ARM_FROM) * swing;
-    sextant.arm.setAttribute("transform", `rotate(${angle - 90} ${SX.P[0]} ${SX.P[1]})`);
-    label.setAttribute("opacity", String(span(t, 3900, 4300) * (1 - span(t, FILM.PUSH, FILM.PUSH + 300))));
-    // the sight line runs from the glass back into the eye
-    sight.setAttribute("stroke-dashoffset", String(1 - easeOut(span(t, 4500, 5100))));
-    sight.setAttribute("opacity", String(0.9 * (1 - span(t, FILM.PUSH, FILM.PUSH + 250))));
-    // the push: the camera goes into the eye's pupil and out onto the map
-    const push = span(t, FILM.PUSH, FILM.PUSH_END);
-    const s = 1 + 320 * push ** 3;
-    scene.setAttribute("transform", `translate(${pupil[0]} ${pupil[1]}) scale(${k * s}) translate(${-SX.EYE[0]} ${-SX.EYE[1]})`);
-    hole.setAttribute("r", String(push > 0 ? SX.PUPIL * SX.EYE_SCALE * k * s : 0));
+    const cam = filmCamera(lay, t);
+    put(art.scene, "transform", `translate(${fx(cam.at[0])} ${fx(cam.at[1])}) rotate(${fx(cam.roll)}) scale(${fx(cam.scale)}) translate(${-SX.EYE[0]} ${-SX.EYE[1]})`);
+    for (const line of art.lines) put(line.node, "stroke-width", fx(line.w / (cam.scale * line.scale)));
+    frameEye(art.eye, t, cam);
+    frameSextant(art.sextant, t);
+    frameRay(art.ray, t, lay.k);
+    frameSky(art.sky, t, cam, lay);
+    frameWords(t);
+    // the dive: the hole in the sheet is the pupil, and the map shows through it
+    put(art.hole, "cx", fx(cam.at[0]));
+    put(art.hole, "cy", fx(cam.at[1]));
+    put(art.hole, "r", cam.push > 0 ? fx(pupilRadius(t) * SX.EYE_SCALE * cam.scale) : 0);
     root.style.opacity = String(1 - span(t, FILM.FADE, FILM.END));
     if (!pushed && t >= FILM.PUSH) {
       pushed = true;
